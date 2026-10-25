@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Interactive commit helper: connect the repo to GitHub if needed, pick or create a
+# branch, enter a message, stage, and commit. It works on the git repository that
+# contains the current directory and stays compatible with the bash 3.2 that macOS
+# ships (no associative arrays, mapfile, or fractional read timeouts).
+
+commit_usage() {
+  printf '%s\n' \
+    'Usage: scripts/commit.sh' \
+    '' \
+    'Run it from inside the project you want to commit.' \
+    'Menu keys: up/down move, enter selects, ctrl+b creates a branch, q quits.'
+}
+
+# ── Commit specification ──────────────────────────────────────────────────────
+# Steps fill these fields and step_commit turns them into a single git commit.
+# To support a new commit option, add a field here, a step that sets it, and its
+# use in commit_compose_message or commit_build_args.
+REPO_NAME=''
+COMMIT_BRANCH=''
+COMMIT_SUBJECT=''
+COMMIT_BODY=''
+COMMIT_TRAILERS=()
+COMMIT_EXTRA_ARGS=()
+STAGE_PATHS=('.')
+
+# Steps run in this order; insert new ones where they belong in the flow.
+COMMIT_PIPELINE=(
+  step_repo
+  step_branch
+  step_message
+  step_stage
+  step_commit
+)
+
+REMOTE_NAME='origin'
+# The branch picked last time, kept in this repository's local git config.
+LAST_BRANCH_KEY='commit-helper.lastBranch'
+UI_MAX_ROWS=10
+
+# ── Terminal UI ───────────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  c_reset=$'\033[0m' c_bold=$'\033[1m' c_dim=$'\033[2m'
+  c_accent=$'\033[36m' c_ok=$'\033[32m' c_warn=$'\033[33m' c_err=$'\033[31m'
+else
+  c_reset='' c_bold='' c_dim='' c_accent='' c_ok='' c_warn='' c_err=''
+fi
+
+ui_restore_terminal() {
+  if [[ -t 1 ]]; then printf '\033[?25h\033[?7h'; fi
+}
+trap ui_restore_terminal EXIT
+trap 'printf "\n"; exit 130' INT
+
+# Every step opens with the repository name so it is always clear what is being changed.
+ui_header() {
+  printf '\n%s%s◆ %s%s %s· %s%s\n' "$c_bold" "$c_accent" "${REPO_NAME:-new repository}" \
+    "$c_reset" "$c_dim" "$1" "$c_reset"
+}
+
+ui_info() { printf '  %s\n' "$*"; }
+ui_ok() { printf '  %s✔%s %s\n' "$c_ok" "$c_reset" "$*"; }
+ui_warn() { printf '  %s!%s %s\n' "$c_warn" "$c_reset" "$*"; }
+ui_error() { printf '  %s✖%s %s\n' "$c_err" "$c_reset" "$*" >&2; }
+
+ui_die() {
+  ui_error "$*"
+  exit 1
+}
+
+ui_cancel() {
+  ui_info "${c_dim}Cancelled; nothing was committed.${c_reset}"
+  exit 0
+}
+
+ui_trim() {
+  local text="$1"
+  text="${text#"${text%%[![:space:]]*}"}"
+  text="${text%"${text##*[![:space:]]}"}"
+  printf '%s' "$text"
+}
+
+# ui_ask <var> <prompt> [default]
+# Line input with readline editing; empty input takes the default. Colour codes in
+# the prompt are wrapped in \001/\002 so readline measures the prompt width correctly.
+# Locals carry a prefix because bash scoping is dynamic: a local with the same name
+# as the caller's <var> would swallow the answer.
+ui_ask() {
+  local _ask_var="$1" _ask_prompt="$2" _ask_default="${3:-}" _ask_answer='' _ask_suffix=''
+  if [[ -n "$_ask_default" ]]; then
+    _ask_suffix=$' \001'"$c_dim"$'\002('"$_ask_default"$')\001'"$c_reset"$'\002'
+  fi
+  IFS= read -e -r -p $'  \001'"$c_accent"$'\002?\001'"$c_reset"$'\002 '"$_ask_prompt$_ask_suffix " _ask_answer ||
+    ui_cancel
+  _ask_answer="$(ui_trim "$_ask_answer")"
+  printf -v "$_ask_var" '%s' "${_ask_answer:-$_ask_default}"
+}
+
+# ui_ask_required <var> <prompt> [default] — repeats until the answer is non-empty.
+ui_ask_required() {
+  while true; do
+    ui_ask "$@"
+    [[ -n "${!1}" ]] && return 0
+    ui_warn 'This value is required.'
+  done
+}
+
+# ui_confirm <prompt> <y|n> — empty input takes the default.
+# It reads a whole line on purpose: with a single-keypress read, the habitual enter
+# after "y" would leak into the next menu and select its first item.
+ui_confirm() {
+  local prompt="$1" default="$2" answer='' choices='[y/N]'
+  [[ "$default" == y ]] && choices='[Y/n]'
+  ui_ask answer "$prompt $choices"
+  case "${answer:-$default}" in
+    y | Y | yes | Yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ui_select <title> <hint> <default index> <item>...
+# Draws an arrow-key menu. Sets UI_INDEX to the highlighted item and UI_ACTION to
+# "select" (enter), "new" (ctrl+b) or "quit" (q or esc); callers ignore actions they
+# do not offer. Long lists scroll inside a window of UI_MAX_ROWS rows.
+UI_INDEX=0
+UI_ACTION=''
+ui_select() {
+  local title="$1" hint="$2" selected="$3"
+  shift 3
+  local items=("$@")
+  local count=${#items[@]} view top=0 drawn=false i key rest position
+
+  view=$count
+  if ((view > UI_MAX_ROWS)); then view=$UI_MAX_ROWS; fi
+  if ((selected < 0 || selected >= count)); then selected=0; fi
+
+  printf '  %s%s%s\n' "$c_bold" "$title" "$c_reset"
+  # Hide the cursor and disable auto-wrap: the redraw moves up one line per row, so a
+  # row wider than the terminal must be clipped rather than wrapped onto a second line.
+  printf '\033[?25l\033[?7l'
+  while true; do
+    if ((selected < top)); then top=$selected; fi
+    if ((selected >= top + view)); then top=$((selected - view + 1)); fi
+    if [[ "$drawn" == true ]]; then printf '\033[%dA' "$((view + 1))"; fi
+    drawn=true
+
+    for ((i = top; i < top + view; i++)); do
+      if ((i == selected)); then
+        printf '\033[2K  %s%s> %s%s\n' "$c_accent" "$c_bold" "${items[i]}" "$c_reset"
+      else
+        printf '\033[2K    %s\n' "${items[i]}"
+      fi
+    done
+    position=''
+    if ((count > view)); then position="   $((selected + 1))/$count"; fi
+    printf '\033[2K  %s%s%s%s\n' "$c_dim" "$hint" "$position" "$c_reset"
+
+    IFS= read -rsn1 key || key=q
+    case "$key" in
+      $'\033')
+        # Arrow keys arrive as ESC [ A/B (or ESC O A/B in application mode); a lone ESC quits.
+        rest=''
+        IFS= read -rsn2 -t 1 rest || true
+        case "$rest" in
+          '[A' | 'OA') selected=$(((selected - 1 + count) % count)) ;;
+          '[B' | 'OB') selected=$(((selected + 1) % count)) ;;
+          '') UI_ACTION=quit; break ;;
+        esac
+        ;;
+      '') UI_ACTION=select; break ;;
+      $'\002') UI_ACTION=new; break ;;
+      q | Q) UI_ACTION=quit; break ;;
+    esac
+  done
+  UI_INDEX=$selected
+
+  # Collapse the menu into a one-line summary of the choice.
+  printf '\033[%dA\033[J\033[?25h\033[?7h' "$((view + 2))"
+  if [[ "$UI_ACTION" == select ]]; then
+    printf '  %s✔%s %s %s%s%s\n' "$c_ok" "$c_reset" "$title" "$c_accent" "${items[selected]}" "$c_reset"
+  fi
+}
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+# Network calls must fail fast instead of stopping at a credential or SSH prompt.
+git_net() {
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" git "$@"
+}
+
+gh_ready() {
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+# owner/name from an https, ssh, or scp-style git URL.
+repo_name_from_url() {
+  local url="${1%/}"
+  url="${url%.git}"
+  printf '%s\n' "$url" | sed -E 's#^.*[:/]([^/:]+/[^/:]+)$#\1#'
+}
+
+# GitHub repository names allow letters, digits, '.', '-' and '_'.
+repo_slug() {
+  printf '%s\n' "$1" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//'
+}
+
+list_contains() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# ── Step: repository ──────────────────────────────────────────────────────────
+step_repo() {
+  local top origin_url
+
+  if top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    cd "$top"
+    if ! git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+      REMOTE_NAME="$(git remote | head -n 1)"
+      REMOTE_NAME="${REMOTE_NAME:-origin}"
+    fi
+    if origin_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null)"; then
+      REPO_NAME="$(repo_name_from_url "$origin_url")"
+      ui_header 'repository'
+      ui_ok "Using local clone at $top"
+      ui_info "${c_dim}$REMOTE_NAME → $origin_url${c_reset}"
+      return 0
+    fi
+    REPO_NAME="$(basename "$top")"
+    ui_header 'repository'
+    ui_warn 'This git repository is not connected to GitHub yet.'
+  else
+    REPO_NAME="$(basename "$PWD")"
+    ui_header 'repository'
+    ui_warn "No git repository found in $PWD"
+    ui_confirm 'Initialise a new git repository here?' y || ui_cancel
+    git init --quiet -b main
+    ui_ok 'Initialised an empty git repository on branch main.'
+  fi
+
+  repo_connect
+}
+
+repo_connect() {
+  while true; do
+    ui_select 'Connect to GitHub' '↑/↓ move · enter select · q quit' 0 \
+      'Create a new GitHub repository' \
+      'Link an existing repository by URL'
+    case "$UI_ACTION" in
+      quit) ui_cancel ;;
+      select) break ;;
+    esac
+  done
+
+  if ((UI_INDEX == 0)); then
+    repo_create
+  else
+    repo_link
+  fi
+}
+
+repo_create() {
+  local user='' name='' visibility default_user=''
+
+  if gh_ready; then
+    default_user="$(gh api user --jq .login 2>/dev/null || true)"
+  fi
+  ui_ask_required user 'GitHub username' "$default_user"
+  while true; do
+    ui_ask_required name 'Repository name' "$(repo_slug "$REPO_NAME")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] && break
+    ui_warn 'Use only letters, digits, ".", "-" and "_".'
+  done
+
+  ui_select 'Visibility' '↑/↓ move · enter select · q quit' 0 'private' 'public'
+  [[ "$UI_ACTION" == select ]] || ui_cancel
+  if ((UI_INDEX == 0)); then visibility=private; else visibility=public; fi
+
+  REPO_NAME="$user/$name"
+  ui_header 'repository'
+  if gh_ready; then
+    ui_confirm "Create $visibility repository github.com/$REPO_NAME now?" y || ui_cancel
+    gh repo create "$REPO_NAME" "--$visibility" >/dev/null || ui_die "GitHub could not create $REPO_NAME."
+    ui_ok "Created $visibility repository github.com/$REPO_NAME"
+  else
+    ui_warn 'The GitHub CLI (gh) is not installed or not signed in, so the repository cannot be created from here.'
+    ui_info "Create ${c_bold}$REPO_NAME${c_reset} ($visibility) at https://github.com/new, then press enter."
+    IFS= read -r _ || ui_cancel
+  fi
+
+  git remote add "$REMOTE_NAME" "https://github.com/$REPO_NAME.git"
+  ui_ok "Linked $REMOTE_NAME → https://github.com/$REPO_NAME.git"
+}
+
+repo_link() {
+  local url=''
+
+  while true; do
+    ui_ask_required url 'Repository URL (https://github.com/owner/repo.git or git@github.com:owner/repo.git)'
+    if git_net ls-remote "$url" >/dev/null 2>&1; then
+      break
+    fi
+    ui_warn "Could not reach $url (wrong URL, no access, or offline)."
+    if ui_confirm 'Link it anyway?' n; then break; fi
+  done
+
+  git remote add "$REMOTE_NAME" "$url"
+  REPO_NAME="$(repo_name_from_url "$url")"
+  ui_header 'repository'
+  ui_ok "Linked $REMOTE_NAME → $url"
+}
+
+# ── Step: branch ──────────────────────────────────────────────────────────────
+step_branch() {
+  local current last branch label width=0 default_index=0 i
+  local branches=() kinds=() labels=()
+
+  ui_header 'branch'
+  if git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+    git_net fetch --quiet --prune "$REMOTE_NAME" 2>/dev/null ||
+      ui_warn "Could not reach $REMOTE_NAME; showing the branches known locally."
+  fi
+
+  current="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [[ -n "$current" ]] || ui_warn 'HEAD is detached; pick a branch to commit on.'
+
+  while IFS= read -r branch; do
+    branches+=("$branch")
+    kinds+=(local)
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+
+  # A new repository's first branch has no commit yet, so for-each-ref cannot see it.
+  if [[ -n "$current" ]] && ! list_contains "$current" ${branches[@]+"${branches[@]}"}; then
+    branches=("$current" ${branches[@]+"${branches[@]}"})
+    kinds=(unborn ${kinds[@]+"${kinds[@]}"})
+  fi
+
+  while IFS= read -r branch; do
+    branch="${branch#refs/remotes/$REMOTE_NAME/}"
+    [[ "$branch" == HEAD ]] && continue
+    list_contains "$branch" ${branches[@]+"${branches[@]}"} && continue
+    branches+=("$branch")
+    kinds+=(remote)
+  done < <(git for-each-ref --format='%(refname)' "refs/remotes/$REMOTE_NAME")
+
+  for branch in ${branches[@]+"${branches[@]}"}; do
+    if ((${#branch} > width)); then width=${#branch}; fi
+  done
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    printf -v label '%-*s' "$width" "${branches[i]}"
+    if [[ "${branches[i]}" == "$current" ]]; then
+      label+="  ${c_ok}● current${c_reset}"
+    fi
+    case "${kinds[i]}" in
+      unborn) label+="  ${c_dim}no commits yet${c_reset}" ;;
+      remote) label+="  ${c_dim}on $REMOTE_NAME only${c_reset}" ;;
+    esac
+    labels+=("$label")
+    if [[ "${branches[i]}" == "$current" ]]; then default_index=$i; fi
+  done
+
+  last="$(git config --local --get "$LAST_BRANCH_KEY" 2>/dev/null || true)"
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    if [[ "${branches[i]}" == "$last" ]]; then default_index=$i; fi
+  done
+
+  while true; do
+    ui_select 'Branch' '↑/↓ move · enter select · ctrl+b new branch · q quit' "$default_index" \
+      ${labels[@]+"${labels[@]}"} "${c_accent}+ New branch…${c_reset}"
+    default_index=$UI_INDEX
+    case "$UI_ACTION" in
+      quit) ui_cancel ;;
+      new) branch_create && break ;;
+      select)
+        if ((UI_INDEX == ${#branches[@]})); then
+          branch_create && break
+        else
+          branch_checkout "${branches[UI_INDEX]}" "${kinds[UI_INDEX]}" "$current" && break
+        fi
+        ;;
+    esac
+  done
+
+  git config --local "$LAST_BRANCH_KEY" "$COMMIT_BRANCH"
+}
+
+# The new branch starts from the current HEAD and keeps the working-tree changes.
+branch_create() {
+  local name=''
+
+  ui_ask name 'New branch name (empty to go back)'
+  [[ -n "$name" ]] || return 1
+  if ! git check-ref-format --branch "$name" >/dev/null 2>&1; then
+    ui_error "Not a valid branch name: $name"
+    return 1
+  fi
+  if git show-ref --verify --quiet "refs/heads/$name"; then
+    ui_error "Branch $name already exists; select it from the list instead."
+    return 1
+  fi
+  git switch --quiet -c "$name" || return 1
+  COMMIT_BRANCH="$name"
+  ui_ok "Created and switched to $name"
+}
+
+# branch_checkout <branch> <local|unborn|remote> <current>
+# Uncommitted changes travel with the switch; git refuses (and the menu reopens)
+# when they would conflict with the target branch. A branch that exists only on the
+# remote gets an explicit tracking branch, since git's name guessing fails when
+# checkout.guess is off or another remote has the same branch.
+branch_checkout() {
+  local name="$1" kind="$2" current="$3"
+
+  if [[ "$kind" == remote ]]; then
+    git switch --quiet -c "$name" --track "$REMOTE_NAME/$name" || return 1
+    ui_ok "Switched to $name (tracking $REMOTE_NAME/$name)"
+  elif [[ "$name" != "$current" ]]; then
+    git switch --quiet "$name" || return 1
+    ui_ok "Switched to $name"
+  fi
+  COMMIT_BRANCH="$name"
+}
+
+# ── Step: message ─────────────────────────────────────────────────────────────
+step_message() {
+  ui_header "message · $COMMIT_BRANCH"
+  if [[ -z "$(git status --porcelain)" ]]; then
+    ui_warn "Nothing to commit on $COMMIT_BRANCH; the working tree is clean."
+    exit 0
+  fi
+  ui_ask_required COMMIT_SUBJECT 'Commit message'
+}
+
+# ── Step: stage ───────────────────────────────────────────────────────────────
+step_stage() {
+  local shown=15 total
+
+  ui_header "stage · $COMMIT_BRANCH"
+  git add -- "${STAGE_PATHS[@]}"
+  if git diff --cached --quiet; then
+    ui_warn "Nothing to commit on $COMMIT_BRANCH after staging ${STAGE_PATHS[*]}."
+    exit 0
+  fi
+
+  total="$(git diff --cached --name-only | wc -l | tr -d ' ')"
+  # sed rather than head: head exits early and pipefail would turn git's SIGPIPE into a failure.
+  git diff --cached --name-status | sed -n "1,${shown}s/^/    /p"
+  if ((total > shown)); then ui_info "${c_dim}  … and $((total - shown)) more${c_reset}"; fi
+  ui_info "${c_dim}$(git diff --cached --shortstat | sed 's/^ *//')${c_reset}"
+}
+
+# ── Step: commit ──────────────────────────────────────────────────────────────
+commit_compose_message() {
+  printf '%s\n' "$COMMIT_SUBJECT"
+  if [[ -n "$COMMIT_BODY" ]]; then
+    printf '\n%s\n' "$COMMIT_BODY"
+  fi
+  if ((${#COMMIT_TRAILERS[@]} > 0)); then
+    printf '\n'
+    printf '%s\n' "${COMMIT_TRAILERS[@]}"
+  fi
+}
+
+# Arguments after `git commit`. Whitespace cleanup keeps lines starting with '#',
+# which the default cleanup would silently drop from the message.
+commit_build_args() {
+  COMMIT_ARGS=(--quiet --cleanup=whitespace -F "$1" ${COMMIT_EXTRA_ARGS[@]+"${COMMIT_EXTRA_ARGS[@]}"})
+}
+
+step_commit() {
+  local message_file
+
+  ui_header "commit · $COMMIT_BRANCH"
+  message_file="$(mktemp "${TMPDIR:-/tmp}/commit-message.XXXXXX")"
+  commit_compose_message >"$message_file"
+  commit_build_args "$message_file"
+  if ! git commit "${COMMIT_ARGS[@]}"; then
+    rm -f "$message_file"
+    ui_die 'git commit failed; see the message above. Your changes are still staged.'
+  fi
+  rm -f "$message_file"
+
+  ui_ok "Committed $(git rev-parse --short HEAD) on $COMMIT_BRANCH in $REPO_NAME"
+  ui_info "${c_dim}$COMMIT_SUBJECT${c_reset}"
+  if git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+    ui_info "${c_dim}Push when ready: git push -u $REMOTE_NAME $COMMIT_BRANCH${c_reset}"
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    -h | --help) commit_usage; return 0 ;;
+    '') ;;
+    *) ui_die "unknown option: $1 (see --help)" ;;
+  esac
+  [[ -t 0 && -t 1 ]] || ui_die 'This script is interactive; run it in a terminal.'
+  command -v git >/dev/null 2>&1 || ui_die 'git is not installed.'
+
+  local step
+  for step in "${COMMIT_PIPELINE[@]}"; do
+    "$step"
+  done
+}
+
+main "$@"
