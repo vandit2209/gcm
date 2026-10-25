@@ -8,7 +8,7 @@ set -euo pipefail
 
 commit_usage() {
   printf '%s\n' \
-    'Usage: scripts/commit.sh' \
+    'Usage: gcm' \
     '' \
     'Run it from inside the project you want to commit.' \
     'Menu keys: up/down move, enter selects, ctrl+b creates a branch, q quits.'
